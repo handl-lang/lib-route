@@ -32,18 +32,18 @@ first_cand := (cs) ~> match cs {
 
 test_cp_shape := assert match rt.compile_pat("/users/:id") {
   c: c.path == "/users/:id" && c.bad == false &&
-     c.use == false && c.constraints = [] &&
-     c.score = [2, 1],
+     c.use == false && c.constraints := [] &&
+     c.score := [2, 1],
   _: false }
 
 test_cp_v3_use := assert rt.compile_pat("/files(/:name)").use == true
 
 cp_cons := rt.compile_pat("/a?x=1&flag&y=a%20b")
 
-test_cp_constraints := assert cp_cons.constraints =
+test_cp_constraints := assert cp_cons.constraints ==
   [{ k: "x", v: "1" }, { k: "flag", v: "" }, { k: "y", v: "a b" }]
 
-test_cp_group_score := assert rt.compile_pat("/a(/b)").score = [2, 2, 0.5]
+test_cp_group_score := assert rt.compile_pat("/a(/b)").score == [2, 2, 0.5]
 
 test_cp_bad_splat := assert rt.compile_pat("/a/*r/b").bad == true
 
@@ -51,52 +51,52 @@ test_cp_bad_splat := assert rt.compile_pat("/a/*r/b").bad == true
 -- match_path: literals, params, splats
 -- ---------------------------------------------------------------------
 
-test_mp_literal := assert rt.match_path("/health", "/health") = {}
+test_mp_literal := assert rt.match_path("/health", "/health") == {}
 
-test_mp_literal_miss := assert rt.match_path("/health", "/healthz") = null
+test_mp_literal_miss := assert rt.match_path("/health", "/healthz") == null
 
-test_mp_param := assert rt.match_path("/users/:id", "/users/42") =
+test_mp_param := assert rt.match_path("/users/:id", "/users/42") ==
   { id: "42" }
 
-test_mp_param_miss := assert rt.match_path("/users/:id", "/users") = null
+test_mp_param_miss := assert rt.match_path("/users/:id", "/users") == null
 
 test_mp_splat_named := assert rt.match_path("/files/*rest",
-  "/files/a/b/c") = { rest: "a/b/c" }
+  "/files/a/b/c") == { rest: "a/b/c" }
 
 test_mp_splat_bare := assert rt.match_path("/files/*",
-  "/files/a/b") = {}
+  "/files/a/b") == {}
 
-test_mp_splat_empty := assert rt.match_path("/files/*rest", "/files") =
+test_mp_splat_empty := assert rt.match_path("/files/*rest", "/files") ==
   { rest: "" }
 
-test_mp_star_all := assert rt.match_path("*", "/anything/at/all") = {}
+test_mp_star_all := assert rt.match_path("*", "/anything/at/all") == {}
 
 -- ---------------------------------------------------------------------
 -- match_path: v3 optional groups + suffix vars
 -- ---------------------------------------------------------------------
 
-test_mp_group_absent := assert rt.match_path("/files(/:name)", "/files") =
+test_mp_group_absent := assert rt.match_path("/files(/:name)", "/files") ==
   {}
 
 test_mp_group_present := assert rt.match_path("/files(/:name)",
-  "/files/x") = { name: "x" }
+  "/files/x") == { name: "x" }
 
-test_mp_group_nested := assert rt.match_path("/a(/b(/c))", "/a/b/c") = {}
+test_mp_group_nested := assert rt.match_path("/a(/b(/c))", "/a/b/c") == {}
 
 test_mp_group_nested_mid := assert rt.match_path("/a(/b(/c))",
-  "/a/b") = {}
+  "/a/b") == {}
 
 test_mp_group_nested_absent := assert rt.match_path("/a(/b(/c))",
-  "/a") = {}
+  "/a") == {}
 
 test_mp_group_nested_miss := assert rt.match_path("/a(/b(/c))",
-  "/a/c") = null
+  "/a/c") == null
 
 test_mp_suffix_vars := assert rt.match_path("/dl/:file.:ext",
-  "/dl/a.b.zip") = { file: "a.b", ext: "zip" }
+  "/dl/a.b.zip") == { file: "a.b", ext: "zip" }
 
 test_mp_prefix_var := assert rt.match_path("/v:version/x",
-  "/v1.2/x") = { version: "1.2" }
+  "/v1.2/x") == { version: "1.2" }
 
 -- ---------------------------------------------------------------------
 -- compile / match / dispatch round-trips
@@ -112,20 +112,20 @@ trie1 := rt.compile(entries1)
 
 test_match_first_cand := assert match first_cand(rt.match_trie(trie1,
   tokens_of("/users/42"))) {
-  c: c != null && c.i == 1 && c.params = { id: "42" } &&
+  c: c != null && c.i == 1 && c.params := { id: "42" } &&
      c.entry.tag == "user",
   _: false }
 
 test_match_splat_cand := assert match first_cand(rt.match_trie(trie1,
   tokens_of("/files/a/b"))) {
-  c: c != null && c.i == 2 && c.params = { rest: "a/b" },
+  c: c != null && c.i == 2 && c.params := { rest: "a/b" },
   _: false }
 
-test_match_miss := assert rt.match_trie(trie1, tokens_of("/nope")) = []
+test_match_miss := assert rt.match_trie(trie1, tokens_of("/nope")) == []
 
 test_dispatch_hit := assert match rt.dispatch(trie1,
   tokens_of("/users/7")) {
-  r: r.hit != null && r.hit.i == 1 && r.hit.params = { id: "7" },
+  r: r.hit != null && r.hit.i == 1 && r.hit.params := { id: "7" },
   _: false }
 
 test_dispatch_miss := assert match rt.dispatch(trie1,
@@ -147,12 +147,12 @@ cons_trie := rt.compile([
 test_compile_pattern_key := assert match first_cand(rt.match_trie(cons_trie,
   tokens_of("/search"))) {
   c: c != null && c.entry.tag == "t" &&
-     c.entry.constraints = [{ k: "q", v: "handl" }],
+     c.entry.constraints := [{ k: "q", v: "handl" }],
   _: false }
 
 test_compile_cons_merge := assert match first_cand(rt.match_trie(cons_trie,
   tokens_of("/other"))) {
-  c: c != null && c.entry.constraints = [{ k: "page", v: "1" }],
+  c: c != null && c.entry.constraints := [{ k: "page", v: "1" }],
   _: false }
 
 -- bad / non-string / non-record entries are skipped
@@ -162,7 +162,7 @@ test_compile_skips := assert match first_cand(rt.match_trie(rt.compile([
     42,
     { path: "/ok" }
   ]), tokens_of("/ok"))) {
-  c: c != null && c.i == 3 && c.params = {},
+  c: c != null && c.i == 3 && c.params := {},
   _: false }
 
 -- ---------------------------------------------------------------------
@@ -195,7 +195,7 @@ test_spec_strict_prefix := assert match rt.dispatch(
 test_spec_splat_last := assert match rt.dispatch(
   rt.compile([{ path: "/a/*r" }, { path: "/a/b" }]),
   tokens_of("/a/b/c")) {
-  r: r.hit != null && r.hit.i == 0 && r.hit.params = { r: "b/c" },
+  r: r.hit != null && r.hit.i == 0 && r.hit.params := { r: "b/c" },
   _: false }
 
 test_spec_all_cands_sorted := assert match rt.match_trie(spec_trie,
@@ -206,10 +206,10 @@ test_spec_all_cands_sorted := assert match rt.match_trie(spec_trie,
 
 -- group expansion: present branch binds before absent branch
 test_group_present_first := assert rt.match_path(
-  "/files(/:name)/*rest", "/files/a/b") = { name: "a", rest: "b" }
+  "/files(/:name)/*rest", "/files/a/b") == { name: "a", rest: "b" }
 
 test_group_absent_splat := assert rt.match_path(
-  "/files(/:name)/*rest", "/files") = { rest: "" }
+  "/files(/:name)/*rest", "/files") == { rest: "" }
 
 -- ---------------------------------------------------------------------
 -- pipeline / chain / end / state
@@ -228,7 +228,7 @@ boom := (_ctx) ~> error.raise("must not run")
 
 test_chain_basic := assert rt.chain([rt.end(
   (req) ~> { status: 200, body: "hi " + req.path })])(
-  { path: "/x" }) = { status: 200, body: "hi /x" }
+  { path: "/x" }) == { status: 200, body: "hi /x" }
 
 -- middleware order: outer mw runs first, state threads through
 mw_a := (ctx, next) ~> do {
@@ -250,7 +250,7 @@ seq_term := (ctx) ~> do {
 }
 
 test_chain_mw_order := assert rt.chain([mw_a, mw_b, seq_term])(
-  { path: "/" }) = "AB"
+  { path: "/" }) == "AB"
 
 -- state flows inward via state_put, outward via the {out,state} pair
 state_term := (ctx) ~> do {
@@ -274,12 +274,12 @@ test_state_put_get := assert rt.state_get(ctx1, "k") == "v" &&
   rt.state_get(ctx0, "k") == null
 
 test_short_circuit := assert rt.chain([mw_short, rt.end(boom)])(
-  { path: "/" }) = { status: 401, body: "denied" }
+  { path: "/" }) == { status: 401, body: "denied" }
 
 -- a bare (non-pair) terminal result normalizes to { out, state }
 test_bare_out_normalized := assert match rt.pipeline([
     (ctx) ~> 42 ])({ req: {}, state: {} }) {
-  r: r.out == 42 && r.state = {},
+  r: r.out == 42 && r.state := {},
   _: false }
 
 test_pipeline_rejects_empty := assert match error.try(
@@ -344,13 +344,13 @@ test_rm_method_map_post := assert while { xs: rm_map, found: false } {
 
 test_rm_spec_leaf := assert match rm_find(rm_map, "op") {
   e: e != null && e.path == "/explicit" && e.method == "PUT" &&
-    e.constraints = [{ k: "q", v: "yes" }],
+    e.constraints := [{ k: "q", v: "yes" }],
   _: false }
 
 -- doc/name annotations pass through verbatim (T-143); `name` overrides
 -- the derived key-path name.
 test_rm_doc_passthrough := assert match rm_find(rm_map, "op") {
-  e: e != null && e.doc = { summary: "x" },
+  e: e != null && e.doc := { summary: "x" },
   _: false }
 
 -- default opts: single arrow leaf, derived name/path, "*" method.
@@ -382,11 +382,11 @@ rm_mspec := rt.route_map({ a: { get: rm_h, doc: { t: 1 } } },
   { methods: ["GET"], spec_keys: ["doc"] })
 
 test_rm_spec_keys := assert match rm_mspec {
-  [e]: e.method == "GET" && e.doc = { t: 1 },
+  [e]: e.method == "GET" && e.doc := { t: 1 },
   _: false }
 
 -- entry lists pass through unchanged for `compile/1`.
-test_rm_list_passthrough := assert rt.route_map([{ path: "/x" }]) =
+test_rm_list_passthrough := assert rt.route_map([{ path: "/x" }]) ==
   [{ path: "/x" }]
 
 -- bad leaves raise with the `route:` prefix.
@@ -404,5 +404,5 @@ rm_trie := rt.compile(rm_map)
 test_rm_compile_roundtrip := assert match rt.dispatch(rm_trie,
   tokens_of("/users/9")) {
   r: r.hit != null && hash_map.get_or(r.hit.entry, "name", null) ==
-    "users/:id" && r.hit.params = { id: "9" },
+    "users/:id" && r.hit.params := { id: "9" },
   _: false }
