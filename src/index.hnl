@@ -1,0 +1,1510 @@
+--- route -- transport-agnostic routing + middleware-pipeline library
+--- (pure handl, P-008 / T-138).
+---
+--- Two halves:
+---
+--- 1. Pattern compiler + segment trie (dispatch). `compile_pat/1`
+---    compiles one pattern string into `{ path, items, bad, use,
+---    constraints, score }`; `compile/1` folds a list of route entries
+---    (`{ path | pattern, ... }` records) into a segment trie;
+---    `match/2`/`dispatch/3` walk the trie over transport-supplied
+---    path tokens (HTTP splits `req.path` on "/"; other transports
+---    supply their own token lists) and return ALL reachable candidates
+---    sorted best-first by the original pattern score (static segment
+---    = 2 > `:param`/mixed = 1(.5) > optional group = 0.5 > splat = 0,
+---    lexicographic, strict-prefix wins, ties keep entry order).
+---    `match_path/2` is the single-pattern convenience.
+---
+---    Pattern grammar (v1/v2/v3 unified -- the trie handles every
+---    pattern, `compile_pat.use` only reports whether v3 productions
+---    were present, for consumers like href generation):
+---      - literal segments must match exactly;
+---      - `:name` binds one segment;
+---      - `*`/` *name` as the LAST item of its (sub)list matches any
+---        remaining segments; `*name` binds the "/"-joined remainder,
+---        bare `*` binds nothing; a splat anywhere else makes the
+---        pattern never match (`bad`);
+---      - `(/seg)` optional groups, nestable to depth 4, at most 8
+---        groups per pattern; groups expand present-branch-before-
+---        absent-branch (<= 256 segment sequences);
+---      - suffix/prefix vars inside a segment: `:file.:ext`, `v:ver`;
+---      - `?k=v&flag` search constraints compile into
+---        `constraints: [{k, v}]` on the compiled record AND are merged
+---        onto each normalized entry's `constraints` list -- dispatch
+---        itself ignores them (they are eligibility data for the
+---        transport, e.g. http-router's query check).
+---      - malformed patterns raise at compile time.
+---
+--- 2. Middleware pipeline. `pipeline/1` folds `[mw..., terminal]`
+---    right-to-left into `(ctx) ~> { out, state }`; `chain/1` seeds
+---    `ctx = { req, state: {} }` and returns the final `out`, so
+---    `serve(chain([...]))` works directly. `end/1` adapts a
+---    `(req) ~> out` handler into a `(ctx) ~> out` terminal.
+---    State merges right-wins; a step returning a bare value is
+---    normalized to `{ out: value, state: <incoming ctx.state> }`.
+---
+--- Exports:
+---   compile_pat(pattern)      ~> { path, items, bad, use,
+---                                  constraints, score }
+---   compile(entries)          ~> trie
+---   match_trie(trie, tokens)   ~> [cand]       -- cand = { i, entry,
+---                                             --   params, score }
+---                                             -- (`match` is a keyword;
+---                                             --  this is the matcher)
+---   dispatch(trie, tokens, accept?) ~> { hit, cands }
+---   match_path(pattern, path) ~> params record | null
+---   route_map(routes, opts?)    ~> [entry]  -- flatten a nested
+---                                  `{ name: leaf | subtree }` map
+---                                  into compile/1-ready entries
+---   pipeline(steps)           ~> (ctx) ~> { out, state }
+---   chain(steps)              ~> (req) ~> out   -- serve-ready
+---   end(h)                    ~> (ctx) ~> out  -- adapt (req) ~> out
+---   state_get(ctx, k)         ~> value | null
+---   state_put(ctx, k, v)      ~> new ctx
+
+from "str" import * as str
+from "char" import * as char
+
+-- ---------------------------------------------------------------------
+-- list / record helpers
+-- ---------------------------------------------------------------------
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+lmap := (f, xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [...out, f(h)] } }
+  }
+}
+
+--- append every element of `bs` onto `a`, preserving order.
+cat := (a, bs) ~> while { xs: bs, out: a } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [...out, h] } }
+  }
+}
+
+mem := (x, xs) ~> while { xs: xs, found: false } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [h, ...t]: if h == x {
+      { out: true }
+    } else {
+      { state: { xs: t, found: found } }
+    }
+  }
+}
+
+is_arr    := (v) ~> type.of(v) == "array"
+is_obj    := (v) ~> type.of(v) == "object"
+is_str    := (v) ~> type.of(v) == "string"
+is_arrow  := (v) ~> type.of(v) == "arrow"
+
+--- first element of a `...rest` variadic tail, or null.
+rest0 := (rest) ~> match rest {
+  [h, ..._t]: h,
+  []: null
+}
+
+-- ---------------------------------------------------------------------
+-- specificity scoring
+-- ---------------------------------------------------------------------
+
+--- true when score list `a` is strictly more specific than `b`:
+--- lexicographic left-to-right, higher segment score wins; a strict
+--- score-prefix wins (exact "/a/b" [2,2] beats "/a/b/*" [2,2,0]); fully
+--- equal scores are a tie (dispatch keeps entry order).
+score_better := (a, b) ~> while { xs: a, ys: b } {
+  (xs, ys) ~> match xs {
+    []: { out: alen(ys) > 0 },
+    [x, ...xt]: match ys {
+      []: { out: false },
+      [y, ...yt]: if x == y {
+        { state: { xs: xt, ys: yt } }
+      } else {
+        { out: x > y }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- percent decoding (shared by `?k=v` constraint parsing)
+-- ---------------------------------------------------------------------
+
+--- hex digit value, -1 when not a hex char.
+hexval := (c) ~> do {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else {
+    if c >= 65 && c <= 70 {
+      c - 55
+    } else {
+      if c >= 97 && c <= 102 {
+        c - 87
+      } else {
+        -1
+      }
+    }
+  }
+}
+
+--- percent-decode `s`: `%XX` -> byte as a char, `+` -> space, invalid
+--- `%` sequences pass through literally.
+pct_decode := (s) ~> while { i: 0, n: str.length(s), acc: "" } {
+  (i, n, acc) ~> if i >= n {
+    { out: acc }
+  } else {
+    do {
+      c := str.char_at(s, i)
+      if c == "%" && i + 2 < n {
+        do {
+          h1 := hexval(char.code_point_at(s, i + 1))
+          h2 := hexval(char.code_point_at(s, i + 2))
+          if h1 >= 0 && h2 >= 0 {
+            { state: { i: i + 3, n: n,
+              acc: acc + char.from_code_point(h1 * 16 + h2) } }
+          } else {
+            { state: { i: i + 1, n: n, acc: acc + c } }
+          }
+        }
+      } else {
+        { state: { i: i + 1, n: n,
+          acc: acc + if c == "+" { " " } else { c } } }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- v3 pattern compiler: optional groups, suffix vars, search constraints
+-- ---------------------------------------------------------------------
+
+OPT_MAX_DEPTH  := 4
+OPT_MAX_GROUPS := 8
+
+--- identifier chars for `:param`/`*name` names: ASCII alnum, '_' and '-'.
+is_nname := (c) ~> (c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
+  (c >= 97 && c <= 122) || c == 95 || c == 45
+
+--- longest `[A-Za-z0-9_-]` run starting at index `i`; "" when none.
+scan_name := (s, i) ~> while { k: i, acc: "" } {
+  (k, acc) ~> if k < str.length(s) && is_nname(char.code_point_at(s, k)) {
+    { state: { k: k + 1, acc: acc + str.char_at(s, k) } }
+  } else {
+    { out: acc }
+  }
+}
+
+flushlit := (toks, lit) ~> if str.is_empty(lit) {
+  toks
+} else {
+  [...toks, { t: "lit", s: lit }]
+}
+
+--- tokenize the path part of a pattern (the `?query` suffix is split
+--- off before this runs). `(` opens an optional group only when
+--- followed by '/' or ')' (otherwise literal); `)` closes a group only
+--- while one is open (otherwise literal); `*` is a splat only at a
+--- segment start (otherwise literal); `:` always opens a `:param`.
+tokenize := (s) ~> while { i: 0, n: str.length(s), toks: [],
+  lit: "", ss: true, depth: 0 } {
+  (i, n, toks, lit, ss, depth) ~> if i >= n {
+    { out: flushlit(toks, lit) }
+  } else {
+    do {
+      c := str.char_at(s, i)
+      nx := if i + 1 < n { str.char_at(s, i + 1) } else { "" }
+      if c == "/" {
+        { state: { i: i + 1, n: n,
+          toks: [...flushlit(toks, lit), { t: "slash" }],
+          lit: "", ss: true, depth: depth } }
+      } else {
+        if c == "(" && (nx == "/" || nx == ")") {
+          { state: { i: i + 1, n: n,
+            toks: [...flushlit(toks, lit), { t: "lp" }],
+            lit: "", ss: true, depth: depth + 1 } }
+        } else {
+          if c == ")" && depth > 0 {
+            { state: { i: i + 1, n: n,
+              toks: [...flushlit(toks, lit), { t: "rp" }],
+              lit: "", ss: false, depth: depth - 1 } }
+          } else {
+            if c == ":" {
+              do {
+                nm := scan_name(s, i + 1)
+                if str.is_empty(nm) {
+                  error.raise("route: empty param name in pattern '" +
+                    s + "'")
+                } else {
+                  { state: { i: i + 1 + str.length(nm), n: n,
+                    toks: [...flushlit(toks, lit),
+                      { t: "param", name: nm }],
+                    lit: "", ss: false, depth: depth } }
+                }
+              }
+            } else {
+              if c == "*" && ss {
+                do {
+                  nm := scan_name(s, i + 1)
+                  { state: { i: i + 1 + str.length(nm), n: n,
+                    toks: [...flushlit(toks, lit),
+                      { t: "star",
+                        name: if str.is_empty(nm) { null } else { nm } }],
+                    lit: "", ss: false, depth: depth } }
+                }
+              } else {
+                { state: { i: i + 1, n: n, toks: toks, lit: lit + c,
+                  ss: false, depth: depth } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- append the pending segment to `items` when it has parts or a
+--- trailing boundary (`bnd` = "after slash", i.e. a segment may be
+--- legitimately empty).
+emit_seg := (items, parts, bnd) ~> if alen(parts) > 0 || bnd {
+  [...items, { k: "seg", parts: parts }]
+} else {
+  items
+}
+
+--- recursive-descent parser over tokens; returns
+--- `{ items, i, bad }` where `i` is the token index just past this
+--- list (past the closing ')' for inner lists) and `bad` marks a
+--- splat that is not the last item of its list (the pattern then
+--- never matches, mirroring the v2 rule). `self` is passed explicitly
+--- because self-recursive `:=` closures are not supported.
+parse_list := (self, toks, i0, inner, depth, src) ~> do {
+  while { i: i0, items: [], parts: [], bnd: inner == false,
+    bad: false } {
+    (i, items, parts, bnd, bad) ~> if bad {
+      { out: { items: [], i: i, bad: true } }
+    } else {
+      if i >= alen(toks) {
+        if inner {
+          error.raise("route: unbalanced '(' in pattern '" + src + "'")
+        } else {
+          { out: { items: emit_seg(items, parts, bnd), i: i,
+            bad: false } }
+        }
+      } else {
+        do {
+          tok := toks[i]
+          if tok.t == "slash" {
+            { state: { i: i + 1, items: emit_seg(items, parts, bnd),
+              parts: [], bnd: true, bad: false } }
+          } else {
+            if tok.t == "lit" {
+              { state: { i: i + 1, items: items,
+                parts: [...parts, { t: "lit", s: tok.s }],
+                bnd: false, bad: false } }
+            } else {
+              if tok.t == "param" {
+                do {
+                  lp := if alen(parts) == 0 {
+                    null
+                  } else {
+                    parts[alen(parts) - 1]
+                  }
+                  if lp != null && lp.t == "param" {
+                    error.raise("route: adjacent params need a " +
+                      "literal separator in '" + src + "'")
+                  } else {
+                    { state: { i: i + 1, items: items,
+                      parts: [...parts, { t: "param", name: tok.name }],
+                      bnd: false, bad: false } }
+                  }
+                }
+              } else {
+                if tok.t == "star" {
+                  do {
+                    nb := i + 1 < alen(toks) && toks[i + 1].t != "rp"
+                    { state: { i: i + 1,
+                      items: [...items, { k: "splat", name: tok.name }],
+                      parts: [], bnd: false, bad: nb } }
+                  }
+                } else {
+                  if tok.t == "lp" {
+                    do {
+                      if depth + 1 > OPT_MAX_DEPTH {
+                        error.raise("route: optional groups nested " +
+                          "too deep (max " +
+                          type.to_string(OPT_MAX_DEPTH) + ") in '" + src +
+                          "'")
+                      } else {
+                        do {
+                          it1 := emit_seg(items, parts, bnd)
+                          nxt := if i + 1 < alen(toks) {
+                            toks[i + 1]
+                          } else {
+                            null
+                          }
+                          if nxt == null ||
+                             (nxt.t != "slash" && nxt.t != "rp") {
+                            error.raise("route: optional group must " +
+                              "start with '/' in '" + src + "'")
+                          } else {
+                            if nxt.t == "rp" {
+                              { state: { i: i + 2, items: it1, parts: [],
+                                bnd: false, bad: false } }
+                            } else {
+                              do {
+                                g := self(self, toks, i + 2, true,
+                                  depth + 1, src)
+                                if g.bad {
+                                  { state: { i: g.i, items: [], parts: [],
+                                    bnd: false, bad: true } }
+                                } else {
+                                  do {
+                                    git := if alen(g.items) == 0 {
+                                      it1
+                                    } else {
+                                      [...it1,
+                                        { k: "group", items: g.items }]
+                                    }
+                                    if g.i < alen(toks) {
+                                      nt := toks[g.i]
+                                      if nt.t != "slash" &&
+                                         nt.t != "rp" &&
+                                         nt.t != "lp" {
+                                        error.raise("route: " +
+                                          "optional group must be " +
+                                          "followed by '/' or end in '" +
+                                          src + "'")
+                                      } else {
+                                        { state: { i: g.i, items: git,
+                                          parts: [], bnd: false,
+                                          bad: false } }
+                                      }
+                                    } else {
+                                      { state: { i: g.i, items: git,
+                                        parts: [], bnd: false,
+                                        bad: false } }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } else {
+                    -- tok.t == "rp"
+                    if inner {
+                      { out: { items: emit_seg(items, parts, bnd),
+                        i: i + 1, bad: false } }
+                    } else {
+                      error.raise("route: unbalanced ')' in pattern '" +
+                        src + "'")
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- total optional groups in `items` (nested included).
+count_groups := (self, items) ~> while { xs: items, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [it, ...t]: { state: { xs: t, n: n + if it.k == "group" {
+        1 + self(self, it.items)
+      } else {
+        0
+      } } }
+  }
+}
+
+nname_str := (s) ~> str.length(scan_name(s, 0)) == str.length(s)
+
+--- true when segment `seg` uses v3 productions (anything but a plain
+--- literal, a pure `:name` or a trailing `*name`/`*`).
+seg_needs := (seg) ~> do {
+  if str.is_empty(seg) {
+    false
+  } else {
+    c0 := str.char_at(seg, 0)
+    if c0 == ":" {
+      r := str.slice(seg, 1, str.length(seg))
+      str.is_empty(r) || nname_str(r) == false
+    } else {
+      if c0 == "*" {
+        nname_str(str.slice(seg, 1, str.length(seg))) == false
+      } else {
+        str.find(seg, ":") >= 0 || str.find(seg, "*") >= 0
+      }
+    }
+  }
+}
+
+--- true when the path part uses v3 grammar (parens or non-v2
+--- segments); such patterns set `use` on the compiled record (consumers
+--- like href generation branch on it -- the trie itself handles every
+--- pattern uniformly).
+needs_compile := (p) ~> do {
+  if str.find(p, "(") >= 0 || str.find(p, ")") >= 0 {
+    true
+  } else {
+    while { xs: str.split(p, "/"), found: false } {
+      (xs, found) ~> match xs {
+        []: { out: found },
+        [s, ...t]: if found || seg_needs(s) {
+          { out: true }
+        } else {
+          { state: { xs: t, found: found } }
+        }
+      }
+    }
+  }
+}
+
+--- per-item specificity score. Literal segment = 2, pure `:param` = 1,
+--- mixed literal+param segment (suffix/prefix vars) = 1.5, optional
+--- group present = 0.5, splat = 0 -- interleaved with the v2 scores
+--- (literal 2 > param 1 > splat 0) so old and new patterns compare.
+parts_score := (parts) ~> do {
+  if alen(parts) == 0 {
+    2
+  } else {
+    if alen(parts) == 1 {
+      if parts[0].t == "param" {
+        1
+      } else {
+        2
+      }
+    } else {
+      do {
+        all_lit := while { xs: parts, ok: true } {
+          (xs, ok) ~> match xs {
+            []: { out: ok },
+            [p, ...t]: if p.t == "lit" {
+              { state: { xs: t, ok: ok } }
+            } else {
+              { out: false }
+            }
+          }
+        }
+        if all_lit {
+          2
+        } else {
+          1.5
+        }
+      }
+    }
+  }
+}
+
+item_score := (it) ~> if it.k == "seg" {
+  parts_score(it.parts)
+} else {
+  if it.k == "splat" {
+    0
+  } else {
+    0.5
+  }
+}
+
+--- match one path segment against compiled `parts` from char `pos`;
+--- returns the accumulated params record or null. A param followed by
+--- a literal anchor captures greedily (longest first), so `:file.:ext`
+--- on "a.b.zip" binds file="a.b", ext="zip". `self` is passed
+--- explicitly (self-recursive `:=` closures are unsupported).
+match_parts := (self, parts, s, pos, params) ~> match parts {
+  []: if pos == str.length(s) {
+    params
+  } else {
+    null
+  },
+  [p, ...rest]: if p.t == "lit" {
+    do {
+      ll := str.length(p.s)
+      if pos + ll <= str.length(s) &&
+         str.slice(s, pos, pos + ll) == p.s {
+        self(self, rest, s, pos + ll, params)
+      } else {
+        null
+      }
+    }
+  } else {
+    if alen(rest) == 0 {
+      hash_map.set(params, p.name, str.slice(s, pos, str.length(s)))
+    } else {
+      while { e: str.length(s), out: null } {
+        (e, out) ~> if e < pos {
+          { out: out }
+        } else {
+          do {
+            r := self(self, rest, s, e,
+              hash_map.set(params, p.name, str.slice(s, pos, e)))
+            if r == null {
+              { state: { e: e - 1, out: null } }
+            } else {
+              { out: r }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- `?k=v&flag` suffix -> ordered list of `{k, v}` constraint pairs
+--- (percent-decoded; bare keys get "").
+parse_qcons := (qs) ~> do {
+  if str.is_empty(qs) {
+    []
+  } else {
+    while { xs: str.split(qs, "&"), out: [] } {
+      (xs, out) ~> match xs {
+        []: { out: out },
+        [s, ...t]: if str.is_empty(s) {
+          { state: { xs: t, out: out } }
+        } else {
+          do {
+            i := str.find(s, "=")
+            if i < 0 {
+              { state: { xs: t,
+                out: [...out, { k: pct_decode(s), v: "" }] } }
+            } else {
+              { state: { xs: t, out: [...out,
+                { k: pct_decode(str.slice(s, 0, i)),
+                  v: pct_decode(str.slice(s, i + 1, str.length(s))) }] } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- compile `pat` into `{ path, items, bad, use, constraints, score }`.
+--- `path` is the pattern minus its `?query` suffix; `items` is the
+--- parsed item list (`{k:"seg",parts}` | `{k:"splat",name}` |
+--- `{k:"group",items}`); `bad` marks a splat that is not last (the
+--- pattern then never matches); `use` reports whether v3 productions
+--- were present; `constraints` holds the `?k=v` pairs; `score` is the
+--- per-item specificity list used for dispatch ranking.
+export compile_pat := (pat) ~> do {
+  qi := str.find(pat, "?")
+  pp := if qi < 0 { pat } else { str.slice(pat, 0, qi) }
+  qs := if qi < 0 { "" } else {
+    str.slice(pat, qi + 1, str.length(pat))
+  }
+  res := parse_list(parse_list, tokenize(pp), 0, false, 0, pp)
+  cg := count_groups(count_groups, res.items)
+  if res.bad == false && cg > OPT_MAX_GROUPS {
+    error.raise("route: too many optional groups in '" + pat +
+      "' (max " + type.to_string(OPT_MAX_GROUPS) + ")")
+  }
+  { path: pp, items: res.items, bad: res.bad, use: needs_compile(pp),
+    constraints: parse_qcons(qs), score: lmap(item_score, res.items) }
+}
+
+-- ---------------------------------------------------------------------
+-- segment trie: compile / match / dispatch
+-- ---------------------------------------------------------------------
+
+--- one compiled segment -> one trie edge descriptor:
+---   { k: "lit",   s }       -- whole segment is one literal
+---   { k: "param", name }    -- whole segment is one `:param`
+---   { k: "parts", parts }   -- mixed literal+param segment
+---   { k: "splat", name }    -- trailing `*`/` *name`
+seg_desc := (parts) ~> do {
+  if alen(parts) == 0 {
+    { k: "lit", s: "" }
+  } else {
+    if alen(parts) == 1 {
+      if parts[0].t == "lit" {
+        { k: "lit", s: parts[0].s }
+      } else {
+        if parts[0].t == "param" {
+          { k: "param", name: parts[0].name }
+        } else {
+          { k: "parts", parts: parts }
+        }
+      }
+    } else {
+      { k: "parts", parts: parts }
+    }
+  }
+}
+
+item_desc := (it) ~> if it.k == "seg" {
+  seg_desc(it.parts)
+} else {
+  { k: "splat", name: it.name }
+}
+
+--- structural equality of two `parts` lists (lit s / param name).
+part_eq := (p, q) ~> p.t == q.t && (if p.t == "lit" {
+  p.s == q.s
+} else {
+  p.name == q.name
+})
+
+parts_eq := (self, a, b) ~> while { xs: a, ys: b } {
+  (xs, ys) ~> match xs {
+    []: { out: alen(ys) == 0 },
+    [p, ...t]: match ys {
+      []: { out: false },
+      [q, ...u]: if part_eq(p, q) {
+        { state: { xs: t, ys: u } }
+      } else {
+        { out: false }
+      }
+    }
+  }
+}
+
+EXPAND_MAX := 256
+
+--- first `n` elements of `xs`.
+take := (n, xs) ~> while { xs: xs, out: [], k: n } {
+  (xs, out, k) ~> match xs {
+    []: { out: out },
+    [h, ...t]: if k <= 0 {
+      { out: out }
+    } else {
+      { state: { xs: t, out: [...out, h], k: k - 1 } }
+    }
+  }
+}
+
+cap_seqs := (seqs) ~> if alen(seqs) > EXPAND_MAX {
+  take(EXPAND_MAX, seqs)
+} else {
+  seqs
+}
+
+--- every way to match `items` against a segment sequence; each result
+--- is a list of edge descriptors `{k:"lit"|"param"|"parts"|"splat"}`.
+--- Optional groups enumerate present-branch sequences before the
+--- absent-branch one (mirroring match_all's order), so earlier groups
+--- win ambiguous binds; the total is capped at EXPAND_MAX (<= 256 for
+--- <= 8 groups). `self` is passed explicitly.
+expand_items := (self, items) ~> match items {
+  []: [[]],
+  [it, ...rest]: if it.k == "group" {
+    do {
+      gs := self(self, it.items)
+      rs := self(self, rest)
+      pres := while { xs: gs, out: [] } {
+        (xs, out) ~> match xs {
+          []: { out: out },
+          [g, ...t]: { state: { xs: t,
+            out: cat(out, lmap((r) ~> cat(g, r), rs)) } }
+        }
+      }
+      cap_seqs(cat(pres, rs))
+    }
+  } else {
+    do {
+      d := item_desc(it)
+      cap_seqs(lmap((r) ~> [d, ...r], self(self, rest)))
+    }
+  }
+}
+
+--- keep a descriptor sequence only up to and including its first
+--- splat -- anything after a splat is unreachable (the splat consumes
+--- the whole remainder).
+trunc_seq := (seq) ~> while { xs: seq, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [d, ...t]: if d.k == "splat" {
+      { out: [...out, d] }
+    } else {
+      { state: { xs: t, out: [...out, d] } }
+    }
+  }
+}
+
+mk_term := (i, entry, score) ~> { i: i, entry: entry, score: score }
+
+--- true when trie edge `e` continues descriptor `d` (lit by `s`,
+--- param by `name`, parts by structural equality).
+edge_eq := (e, d) ~> if d.k == "lit" {
+  e.k == "lit" && e.s == d.s
+} else {
+  if d.k == "param" {
+    e.k == "param" && e.name == d.name
+  } else {
+    e.k == "parts" && parts_eq(parts_eq, e.parts, d.parts)
+  }
+}
+
+mk_edge := (d, node) ~> if d.k == "lit" {
+  { k: "lit", s: d.s, node: node }
+} else {
+  if d.k == "param" {
+    { k: "param", name: d.name, node: node }
+  } else {
+    { k: "parts", parts: d.parts, node: node }
+  }
+}
+
+--- insert descriptor `d` + `rest` into `edges`, merging with an
+--- existing same-kind edge or appending a new one.
+ins_edge := (self, edges, d, rest, i, entry, score) ~> while {
+  xs: edges, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: [...out, mk_edge(d,
+      self(self, { edges: [], terms: [] }, rest, i, entry, score))] },
+    [e, ...t]: if edge_eq(e, d) {
+      { out: [...out, hash_map.merge(e,
+        { node: self(self, e.node, rest, i, entry, score) }), ...t] }
+    } else {
+      { state: { xs: t, out: [...out, e] } }
+    }
+  }
+}
+
+--- insert a terminal term into the splat edge named `name`, merging
+--- with an existing same-name splat edge.
+ins_splat := (edges, name, i, entry, score) ~> while {
+  xs: edges, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: [...out, { k: "splat", name: name,
+      terms: [mk_term(i, entry, score)] }] },
+    [e, ...t]: if e.k == "splat" && e.name == name {
+      { out: [...out, hash_map.merge(e,
+        { terms: [...e.terms, mk_term(i, entry, score)] }), ...t] }
+    } else {
+      { state: { xs: t, out: [...out, e] } }
+    }
+  }
+}
+
+--- insert descriptor sequence `seq` into `node`, returning a new node
+--- (nodes/edges are immutable records). A terminal `[]` appends
+--- `{ i, entry, score }` to `node.terms`; a splat descriptor attaches
+--- its term to the node's splat edge (it consumes the whole rest).
+insert_seq := (self, node, seq, i, entry, score) ~> match seq {
+  []: hash_map.merge(node,
+    { terms: [...node.terms, mk_term(i, entry, score)] }),
+  [d, ...rest]: if d.k == "splat" {
+    hash_map.merge(node, { edges: ins_splat(node.edges, d.name,
+      i, entry, score) })
+  } else {
+    hash_map.merge(node, { edges: ins_edge(insert_seq, node.edges, d,
+      rest, i, entry, score) })
+  }
+}
+
+--- fold route `entries` (records with `"path"` or `"pattern"`) into a
+--- segment trie. Entries with a missing/non-string pattern or a `bad`
+--- compile are skipped; each surviving entry is normalized with its
+--- pattern `?k=v` constraints appended to `entry.constraints`, and its
+--- ORIGINAL index `i` + pattern `score` ride on every terminal term
+--- (ranking uses the score list, not per-expansion scores).
+export compile := (entries) ~> while {
+  xs: entries, i: 0, trie: { edges: [], terms: [] } } {
+  (xs, i, trie) ~> match xs {
+    []: { out: trie },
+    [e, ...t]: if is_obj(e) == false {
+      { state: { xs: t, i: i + 1, trie: trie } }
+    } else {
+      do {
+        pat := hash_map.get_or(e, "path",
+          hash_map.get_or(e, "pattern", null))
+        if is_str(pat) == false {
+          { state: { xs: t, i: i + 1, trie: trie } }
+        } else {
+          do {
+            c := compile_pat(pat)
+            if c.bad {
+              { state: { xs: t, i: i + 1, trie: trie } }
+            } else {
+              do {
+                ec := hash_map.get_or(e, "constraints", [])
+                ecl := if is_arr(ec) { ec } else { [] }
+                ne := hash_map.merge(e,
+                  { constraints: cat(ecl, c.constraints) })
+                seqs := expand_items(expand_items, c.items)
+                trie2 := while { ys: seqs, tr: trie } {
+                  (ys, tr) ~> match ys {
+                    []: { out: tr },
+                    [sq, ...u]: { state: { ys: u, tr: insert_seq(
+                      insert_seq, tr, trunc_seq(sq), i, ne,
+                      c.score) } }
+                  }
+                }
+                { state: { xs: t, i: i + 1, trie: trie2 } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- "/"-joined remainder binding for a splat edge; "" for the empty
+--- remainder (an exhausted path still matches a trailing splat).
+join_rest := (tokens) ~> if alen(tokens) == 0 {
+  ""
+} else {
+  str.join(tokens, "/")
+}
+
+cand_of := (t, params) ~> {
+  i: t.i, entry: t.entry, params: params, score: t.score }
+
+--- recursive trie walk collecting ALL reachable candidates as
+--- `{ i, entry, params, score }` records in traversal order. Edges are
+--- tried in kind order lit -> parts -> param -> splat (insertion order
+--- within a kind), so more specific bindings are found first; `self`
+--- is passed explicitly.
+walk := (self, node, tokens, params) ~> match tokens {
+  []: do {
+    base := lmap((t) ~> cand_of(t, params), node.terms)
+    sp := while { xs: node.edges, out: [] } {
+      (xs, out) ~> match xs {
+        []: { out: out },
+        [e, ...t]: if e.k == "splat" {
+          do {
+            p2 := if e.name == null {
+              params
+            } else {
+              hash_map.set(params, e.name, join_rest([]))
+            }
+            { state: { xs: t, out: cat(out,
+              lmap((tm) ~> cand_of(tm, p2), e.terms)) } }
+          }
+        } else {
+          { state: { xs: t, out: out } }
+        }
+      }
+    }
+    cat(base, sp)
+  },
+  [s, ...st]: do {
+    kc := (kind) ~> while { xs: node.edges, out: [] } {
+      (xs, out) ~> match xs {
+        []: { out: out },
+        [e, ...t]: if e.k == kind {
+          if kind == "lit" {
+            if e.s == s {
+              { state: { xs: t,
+                out: cat(out, self(self, e.node, st, params)) } }
+            } else {
+              { state: { xs: t, out: out } }
+            }
+          } else {
+            if kind == "parts" {
+              do {
+                r := match_parts(match_parts, e.parts, s, 0, {})
+                if r == null {
+                  { state: { xs: t, out: out } }
+                } else {
+                  { state: { xs: t, out: cat(out,
+                    self(self, e.node, st,
+                      hash_map.merge(params, r))) } }
+                }
+              }
+            } else {
+              if kind == "param" {
+                { state: { xs: t, out: cat(out,
+                  self(self, e.node, st,
+                    hash_map.set(params, e.name, s))) } }
+              } else {
+                -- splat: consumes ALL remaining tokens (s included)
+                do {
+                  p2 := if e.name == null {
+                    params
+                  } else {
+                    hash_map.set(params, e.name, join_rest(tokens))
+                  }
+                  { state: { xs: t, out: cat(out,
+                    lmap((tm) ~> cand_of(tm, p2), e.terms)) } }
+                }
+              }
+            }
+          }
+        } else {
+          { state: { xs: t, out: out } }
+        }
+      }
+    }
+    cat(kc("lit"), cat(kc("parts"), cat(kc("param"), kc("splat"))))
+  }
+}
+
+--- dedupe candidates by entry index `i`, keeping the first-found
+--- params (traversal order = most-specific-first).
+dedupe := (cands) ~> while { xs: cands, seen: [], out: [] } {
+  (xs, seen, out) ~> match xs {
+    []: { out: out },
+    [c, ...t]: if mem(c.i, seen) {
+      { state: { xs: t, seen: seen, out: out } }
+    } else {
+      { state: { xs: t, seen: [...seen, c.i], out: [...out, c] } }
+    }
+  }
+}
+
+--- true when candidate `c1` ranks before `c2`: strictly better score
+--- wins; equal scores keep lower entry index first.
+cand_better := (c1, c2) ~> if score_better(c1.score, c2.score) {
+  true
+} else {
+  if score_better(c2.score, c1.score) {
+    false
+  } else {
+    c1.i <= c2.i
+  }
+}
+
+--- insert `c` into score-sorted `ys` (best-first).
+ins_cand := (self, c, ys) ~> match ys {
+  []: [c],
+  [y, ...t]: if cand_better(c, y) {
+    [c, y, ...t]
+  } else {
+    [y, ...self(self, c, t)]
+  }
+}
+
+sort_cands := (self, cands) ~> while { xs: cands, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [c, ...t]: { state: { xs: t, out: ins_cand(ins_cand, c, out) } }
+  }
+}
+
+--- walk `trie` over `tokens` (transport-split path segments, e.g.
+--- `str.split(path, "/")`) and return ALL reachable candidates sorted
+--- best-first: `[{ i, entry, params, score }]`. Not first-match --
+--- transports use the full list for 404/405-style decisions.
+--- (`match` is a reserved keyword and cannot be exported under that
+--- name in this dialect, so the export is `match_trie`.)
+export match_trie := (trie, tokens) ~> do {
+  sort_cands(sort_cands,
+    dedupe(walk(walk, trie, tokens, {})))
+}
+
+--- dispatch `tokens` through `trie`: `cands` is the full sorted match
+--- list; `hit` is the first candidate passing `accept` (default: all
+--- candidates), else null. Transports use `cands` for miss decisions.
+export dispatch := (trie, tokens, ...rest) ~> do {
+  acc := if alen(rest) == 0 { (c) ~> true } else { rest0(rest) }
+  cs := match_trie(trie, tokens)
+  hit := while { xs: cs, out: null } {
+    (xs, out) ~> match xs {
+      []: { out: out },
+      [c, ...t]: if acc(c) {
+        { out: c }
+      } else {
+        { state: { xs: t, out: out } }
+      }
+    }
+  }
+  { hit: hit, cands: cs }
+}
+
+--- convenience: compile a single pattern and match `path` against it;
+--- returns the best candidate's params record, or null. (Compile cost
+--- per call is fine for one-off checks; servers should `compile` once
+--- and `dispatch` per request.)
+export match_path := (pattern, path) ~> do {
+  cs := match_trie(compile([{ path: pattern }]), str.split(path, "/"))
+  match cs {
+    []: null,
+    [c, ..._t]: c.params
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- route maps: flatten nested `{ name: leaf | subtree }` records into
+-- normalized entry lists ready for `compile/1` (T-143 / P-008 phase 2;
+-- generalized from lib-http-router's v2 route-map builder).
+-- ---------------------------------------------------------------------
+
+lfilter := (f, xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: if f(h) {
+      { state: { xs: t, out: [...out, h] } }
+    } else {
+      { state: { xs: t, out: out } }
+    }
+  }
+}
+
+--- spec fields the flattener consumes itself (path overrides, method
+--- selectors, constraints): never copied verbatim onto entries.
+RM_CONSUMED := ["path", "pattern", "method", "methods", "constraints"]
+
+--- annotation fields copied verbatim onto every entry they annotate.
+RM_ANNOT := ["name", "doc"]
+
+--- key segments that contribute to a derived path/name ("." and ""
+--- are index markers, not segments).
+rm_clean := (segs) ~> lfilter((s) ~> s != "." && s != "", segs)
+
+rm_derived_path := (segs, sep) ~> do {
+  cs := rm_clean(segs)
+  if alen(cs) == 0 { sep } else { sep + str.join(cs, sep) }
+}
+
+rm_derived_name := (segs, sep) ~> do {
+  cs := rm_clean(segs)
+  if alen(cs) == 0 { "index" } else { str.join(cs, sep) }
+}
+
+--- explicit `path`/`pattern` wins; a missing leading `sep` is added.
+rm_norm_path := (p, sep) ~> if str.starts_with(p, sep) {
+  p
+} else {
+  sep + p
+}
+
+rm_explicit_path := (v, fallback, sep) ~> do {
+  pp := hash_map.get_or(v, "path",
+    hash_map.get_or(v, "pattern", null))
+  if pp == null {
+    fallback
+  } else {
+    if is_str(pp) {
+      rm_norm_path(pp, sep)
+    } else {
+      error.raise("route: route 'path'/'pattern' must be a string")
+    }
+  }
+}
+
+--- normalize `method`/`methods` (string or list of strings) to a list
+--- of uppercased method names; absent -> ["*"].
+rm_methods_of := (v) ~> do {
+  norm := (mv) ~> if is_str(mv) {
+    [str.upper(mv)]
+  } else {
+    if is_arr(mv) {
+      lmap((m) ~> if is_str(m) {
+        str.upper(m)
+      } else {
+        error.raise("route: method names must be strings")
+      }, mv)
+    } else {
+      error.raise("route: 'method'/'methods' must be a string or list")
+    }
+  }
+  if hash_map.has(v, "methods") {
+    norm(hash_map.get_or(v, "methods", []))
+  } else {
+    if hash_map.has(v, "method") {
+      norm(hash_map.get_or(v, "method", "*"))
+    } else {
+      ["*"]
+    }
+  }
+}
+
+--- normalize a `constraints` spec (record `{k: v}` or list of
+--- `{k,v}`/`{key,value}`/`[k,v]` pairs) to a list of `{k, v}` pairs;
+--- null when absent.
+rm_norm_cons := (v) ~> if v == null {
+  null
+} else {
+  if is_obj(v) {
+    lmap((k) ~> { k: k, v: hash_map.get_or(v, k, null) },
+      hash_map.keys(v))
+  } else {
+    if is_arr(v) {
+      lmap((p) ~> if is_obj(p) {
+        { k: hash_map.get_or(p, "k",
+            hash_map.get_or(p, "key", null)),
+          v: hash_map.get_or(p, "v",
+            hash_map.get_or(p, "value", null)) }
+      } else {
+        if is_arr(p) && alen(p) == 2 {
+          { k: p[0], v: p[1] }
+        } else {
+          error.raise("route: 'constraints' entries must be " +
+            "{k,v} pairs")
+        }
+      }, v)
+    } else {
+      error.raise("route: 'constraints' must be a record or " +
+        "list of pairs")
+    }
+  }
+}
+
+rm_is_method_key := (k, methods_u) ~>
+  is_str(k) && mem(str.upper(k), methods_u)
+
+rm_is_spec_key := (k, spec_keys) ~> mem(k, spec_keys)
+
+--- true when `v` is a pure method map: at least one method key and
+--- no keys other than method names, `spec_keys`, or the built-in
+--- spec fields (`path`/`pattern`/`method`/`methods`/`constraints`).
+rm_is_method_map := (v, o) ~> do {
+  ks := hash_map.keys(v)
+  mks := lfilter((k) ~> rm_is_method_key(k, o.methods_u), ks)
+  bad := lfilter((k) ~> rm_is_method_key(k, o.methods_u) == false &&
+    rm_is_spec_key(k, o.spec_keys) == false &&
+    mem(k, RM_CONSUMED) == false, ks)
+  alen(mks) > 0 && alen(bad) == 0
+}
+
+--- true when `v` carries any configured leaf key.
+rm_has_leaf := (v, leaf_keys) ~> while { xs: leaf_keys, found: false } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [k, ...t]: if hash_map.has(v, k) {
+      { out: true }
+    } else {
+      { state: { xs: t, found: found } }
+    }
+  }
+}
+
+--- leaf/spec fields copied verbatim onto entries: `leaf_keys` and
+--- `spec_keys` minus the consumed spec fields and the name/doc
+--- annotations (handled separately).
+rm_extra_keys := (o) ~> cat(
+  lfilter((k) ~> mem(k, RM_CONSUMED) == false &&
+    mem(k, RM_ANNOT) == false, o.leaf_keys),
+  lfilter((k) ~> mem(k, RM_CONSUMED) == false &&
+    mem(k, RM_ANNOT) == false, o.spec_keys))
+
+--- copy configured payload fields (`handler`, transport-specific
+--- leaf keys, spec_keys extras) from leaf record `v` onto entry `e`.
+rm_passthrough := (v, e, o) ~> while { xs: rm_extra_keys(o), out: e } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [k, ...t]: { state: { xs: t,
+      out: if hash_map.has(v, k) {
+        hash_map.set(out, k, hash_map.get_or(v, k, null))
+      } else {
+        out
+      } } }
+  }
+}
+
+--- `name`/`doc` annotations pass through verbatim (T-143): an explicit
+--- `name` overrides the derived key-path name.
+rm_annotate := (v, e) ~> do {
+  e2 := if hash_map.has(v, "doc") {
+    hash_map.set(e, "doc", hash_map.get_or(v, "doc", null))
+  } else {
+    e
+  }
+  if hash_map.has(v, "name") {
+    hash_map.set(e2, "name", hash_map.get_or(v, "name", null))
+  } else {
+    e2
+  }
+}
+
+rm_set_cons := (e, cons) ~> if cons == null {
+  e
+} else {
+  hash_map.set(e, "constraints", cons)
+}
+
+--- leaf spec record -> one entry per method (`method`/`methods`
+--- normalized, `path`/`pattern` override, `constraints` normalized).
+rm_spec_entries := (v, segs, o) ~> do {
+  chk := if hash_map.has(v, "handler") {
+    if is_arrow(hash_map.get_or(v, "handler", null)) {
+      true
+    } else {
+      error.raise("route: route 'handler' must be an arrow")
+    }
+  } else {
+    true
+  }
+  payload := lfilter((k) ~> mem(k, RM_CONSUMED) == false &&
+    mem(k, RM_ANNOT) == false, o.leaf_keys)
+  has_payload := while { xs: payload, found: false } {
+    (xs, found) ~> match xs {
+      []: { out: found },
+      [k, ...t]: if hash_map.has(v, k) {
+        { out: true }
+      } else {
+        { state: { xs: t, found: found } }
+      }
+    }
+  }
+  if chk == true && payload != [] && has_payload == false {
+    error.raise("route: route leaf has no handler field")
+  } else {
+    do {
+      path := rm_explicit_path(v, rm_derived_path(segs, o.sep), o.sep)
+      if str.is_empty(path) {
+        error.raise("route: route leaf produced an empty path")
+      } else {
+        do {
+          nm := rm_derived_name(segs, o.sep)
+          cons := rm_norm_cons(hash_map.get_or(v, "constraints", null))
+          lmap((m) ~> do {
+            e := rm_passthrough(v,
+              { name: nm, method: m, path: path }, o)
+            rm_annotate(v, rm_set_cons(e, cons))
+          }, rm_methods_of(v))
+        }
+      }
+    }
+  }
+}
+
+--- method map `{ get: h, post: h, ... }` -> one entry per method key
+--- (case-insensitive, stored uppercased) at the shared explicit or
+--- derived path.
+rm_mmap_entries := (v, segs, o) ~> do {
+  path := rm_explicit_path(v, rm_derived_path(segs, o.sep), o.sep)
+  if str.is_empty(path) {
+    error.raise("route: route leaf produced an empty path")
+  } else {
+    do {
+      nm := rm_derived_name(segs, o.sep)
+      cons := rm_norm_cons(hash_map.get_or(v, "constraints", null))
+      while { xs: hash_map.keys(v), out: [] } {
+        (xs, out) ~> match xs {
+          []: { out: out },
+          [k, ...t]: if rm_is_method_key(k, o.methods_u) {
+            do {
+              h := hash_map.get_or(v, k, null)
+              if is_arrow(h) == false {
+                error.raise("route: method '" + k +
+                  "' leaf must be an arrow")
+              } else {
+                do {
+                  e := rm_passthrough(v, { name: nm,
+                    method: str.upper(k), path: path, handler: h }, o)
+                  { state: { xs: t, out: [...out,
+                    rm_annotate(v, rm_set_cons(e, cons))] } }
+                }
+              }
+            }
+          } else {
+            { state: { xs: t, out: out } }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- recursive route-map walker; `self` is passed explicitly because
+--- self-recursive `:=` closures are not supported by the engines.
+--- `v` is a leaf or nested map; `segs` is the accumulated key path.
+rm_walk := (self, v, segs, o) ~> do {
+  if is_arrow(v) {
+    [ { name: rm_derived_name(segs, o.sep), method: "*",
+        path: rm_derived_path(segs, o.sep), handler: v } ]
+  } else {
+    if is_obj(v) == false {
+      error.raise("route: route leaf must be an arrow or record (got " +
+        type.of(v) + ")")
+    } else {
+      if hash_map.has(v, o.handler_key) {
+        rm_spec_entries(v, segs, o)
+      } else {
+        if rm_is_method_map(v, o) {
+          rm_mmap_entries(v, segs, o)
+        } else {
+          if rm_has_leaf(v, o.leaf_keys) {
+            rm_spec_entries(v, segs, o)
+          } else {
+            while { xs: hash_map.keys(v), out: [] } {
+              (xs, out) ~> match xs {
+                []: { out: out },
+                [k, ...t]: do {
+                  sub := hash_map.get_or(v, k, null)
+                  nsegs := if k == "." || k == "" {
+                    segs
+                  } else {
+                    [...segs, k]
+                  }
+                  ents := self(self, sub, nsegs, o)
+                  { state: { xs: t, out: cat(out, ents) } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- flatten a route map (nested `{ name: leaf | subtree }` records)
+--- into a list of normalized entries ready for `compile/1`:
+--- `{ name, method, path, handler?, ... }` where `method` is the
+--- uppercased method name or "*", `path` is the explicit
+--- `path`/`pattern` override or the key-path-derived pattern, and
+--- `constraints` is the normalized `{k, v}` pair list when present.
+--- `name`/`doc` annotations on leaf records pass through verbatim.
+---
+--- `opts` (all optional):
+---   sep        -- segment separator joining keys into path/name
+---                 (default "/"); "." and "" keys contribute no segment
+---   leaf_keys  -- record keys marking a spec leaf (default
+---                 ["handler"]); the first entry is the primary
+---                 handler key (checked for arrow-ness and copied
+---                 onto entries)
+---   spec_keys  -- extra keys allowed inside method maps (treated as
+---                 spec fields, not subtrees) and copied verbatim
+---                 onto method-map entries (default [])
+---   methods    -- method-name strings recognised as method-map keys
+---                 (matched case-insensitively, emitted uppercased;
+---                 default [])
+--- An entry list passes through unchanged.
+export route_map := (routes, ...rest) ~> do {
+  o0 := if alen(rest) == 0 { {} } else { rest0(rest) }
+  if is_obj(o0) == false {
+    error.raise("route: route_map opts must be a record")
+  } else {
+    do {
+      sep := hash_map.get_or(o0, "sep", "/")
+      leaf_keys := hash_map.get_or(o0, "leaf_keys", ["handler"])
+      spec_keys := hash_map.get_or(o0, "spec_keys", [])
+      methods := hash_map.get_or(o0, "methods", [])
+      if is_arr(leaf_keys) == false || is_arr(spec_keys) == false ||
+         is_arr(methods) == false {
+        error.raise("route: route_map opts lists must be arrays")
+      } else {
+        do {
+          methods_u := lmap((m) ~> if is_str(m) {
+            str.upper(m)
+          } else {
+            m
+          }, methods)
+          o := {
+            sep: sep,
+            leaf_keys: leaf_keys,
+            spec_keys: spec_keys,
+            methods_u: methods_u,
+            handler_key: if alen(leaf_keys) == 0 {
+              "handler"
+            } else {
+              leaf_keys[0]
+            }
+          }
+          if is_arr(routes) {
+            routes
+          } else {
+            rm_walk(rm_walk, routes, [], o)
+          }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- middleware pipeline: { out, state } pairs over { req, state } ctx
+-- ---------------------------------------------------------------------
+
+revlist := (xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [h, ...out] } }
+  }
+}
+
+state_of := (ctx) ~> hash_map.get_or(ctx, "state", {})
+req_of   := (ctx) ~> hash_map.get_or(ctx, "req", {})
+
+--- normalize any step result to the `{ out, state }` pair. A record
+--- carrying an `out` key is already a pair (missing `state` falls back
+--- to the ctx the step saw); anything else is a bare output value.
+as_pair := (r, ctx) ~> do {
+  if is_obj(r) && hash_map.has(r, "out") {
+    { out: hash_map.get_or(r, "out", null),
+      state: hash_map.get_or(r, "state", state_of(ctx)) }
+  } else {
+    { out: r, state: state_of(ctx) }
+  }
+}
+
+export state_get := (ctx, k) ~> hash_map.get_or(state_of(ctx), k, null)
+
+--- returns a NEW ctx with `k -> v` merged into state (right-wins: v
+--- overrides any existing `k`).
+export state_put := (ctx, k, v) ~> do {
+  hash_map.merge(ctx, { state: hash_map.set(state_of(ctx), k, v) })
+}
+
+--- validate every step is an arrow.
+all_arrows := (xs) ~> while { xs: xs, ok: true } {
+  (xs, ok) ~> match xs {
+    []: { out: ok },
+    [h, ...t]: if is_arrow(h) {
+      { state: { xs: t, ok: ok } }
+    } else {
+      { out: false }
+    }
+  }
+}
+
+--- fold `steps` right-to-left into `(ctx) ~> { out, state }`.
+--- steps = [mw..., terminal]; every element but the last is a
+--- middleware `(ctx, next) ~> { out, state }`; the last is the
+--- terminal `(ctx) ~> out | { out, state }`.
+export pipeline := (steps) ~> do {
+  if is_arr(steps) == false || alen(steps) == 0 {
+    error.raise("route: pipeline needs a non-empty list of steps")
+  } else {
+    if all_arrows(steps) == false {
+      error.raise("route: every pipeline step must be an arrow")
+    } else {
+      do {
+        rs := revlist(steps)              -- [terminal, mwN, ..., mw1]
+        term := rs[0]
+        termn := (ctx) ~> as_pair(term(ctx), ctx)
+        mids := match rs {
+          [_t, ...t]: t,
+          []: []
+        }
+        acc := while { xs: mids, acc: termn } {
+          (xs, acc) ~> match xs {
+            []: { out: acc },
+            [mw, ...t]: do {
+              nxt := acc
+              { state: { xs: t,
+                acc: (ctx) ~> as_pair(mw(ctx, nxt), ctx) } }
+            }
+          }
+        }
+        acc
+      }
+    }
+  }
+}
+
+--- serve-ready handler: `serve(chain([mw..., terminal]), { port })`.
+--- Seeds `ctx = { req, state: {} }` and returns the final `out`.
+export chain := (steps) ~> do {
+  p := pipeline(steps)
+  (req) ~> do {
+    r := p({ req: req, state: {} })
+    r.out
+  }
+}
+
+--- adapt a `(req) ~> out` handler into a `(ctx) ~> out` terminal for
+--- `pipeline`/`chain`.
+export end := (h) ~> (ctx) ~> h(req_of(ctx))
