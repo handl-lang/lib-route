@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# bupha entry point (runner.kind = "script", cmd = "./ci.sh").
-# The gate itself lives in scripts/hnl-gate.sh so it can be run by hand.
+# Gate entry — the handl-gates campaign (workflows/gate.yaml ->
+# gates/handl.yaml) runs `bash ci.sh` when present; ci.sh delegates
+# to scripts/hnl-gate.sh so the gate can also be run by hand.
 set -euo pipefail
 
 # Skeleton repos have the layout but no implementation yet — a skipped gate is
