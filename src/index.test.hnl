@@ -7,24 +7,11 @@
 
 from "./index" import * as rt
 from "str" import * as str
+from "./test_fixtures" import *
 
--- ---------------------------------------------------------------------
--- fixtures
--- ---------------------------------------------------------------------
-
-alen2 := (xs) ~> while { xs: xs, n: 0 } {
-  (xs, n) ~> match xs {
-    []: { out: n },
-    [_h, ...t]: { state: { xs: t, n: n + 1 } }
-  }
-}
-
-tokens_of := (p) ~> str.split(p, "/")
-
-first_cand := (cs) ~> match cs {
-  [c, ..._t]: c,
-  []: null
-}
+-- shared fixtures/helpers live in ./test_fixtures (an imported module
+-- evaluates once per worker; top-level statements here would re-run
+-- per test case — see that file's header)
 
 -- ---------------------------------------------------------------------
 -- compile_pat: record shape
@@ -37,8 +24,6 @@ test_cp_shape := assert match rt.compile_pat("/users/:id") {
   _: false }
 
 test_cp_v3_use := assert rt.compile_pat("/files(/:name)").use == true
-
-cp_cons := rt.compile_pat("/a?x=1&flag&y=a%20b")
 
 test_cp_constraints := assert cp_cons.constraints ==
   [{ k: "x", v: "1" }, { k: "flag", v: "" }, { k: "y", v: "a b" }]
@@ -102,14 +87,6 @@ test_mp_prefix_var := assert rt.match_path("/v:version/x",
 -- compile / match / dispatch round-trips
 -- ---------------------------------------------------------------------
 
-entries1 := [
-  { path: "/health" },
-  { path: "/users/:id", tag: "user" },
-  { path: "/files/*rest" }
-]
-
-trie1 := rt.compile(entries1)
-
 test_match_first_cand := assert match first_cand(rt.match_trie(trie1,
   tokens_of("/users/42"))) {
   c: c != null && c.i == 1 && c.params := { id: "42" } &&
@@ -139,10 +116,6 @@ test_dispatch_accept := assert match rt.dispatch(trie1,
   _: false }
 
 -- pattern key + constraints merge onto the normalized entry
-cons_trie := rt.compile([
-  { pattern: "/search?q=handl", tag: "t" },
-  { path: "/other", constraints: [{ k: "page", v: "1" }] }
-])
 
 test_compile_pattern_key := assert match first_cand(rt.match_trie(cons_trie,
   tokens_of("/search"))) {
@@ -168,13 +141,6 @@ test_compile_skips := assert match first_cand(rt.match_trie(rt.compile([
 -- ---------------------------------------------------------------------
 -- specificity: literal > param > splat; strict prefix; ties -> order
 -- ---------------------------------------------------------------------
-
-spec_trie := rt.compile([
-  { path: "/a/:x" },      -- i=0 param
-  { path: "/a/b" },       -- i=1 literal
-  { path: "/a/b/*r" },    -- i=2 splat
-  { path: "/a/:y" }       -- i=3 param, ties with i=0
-])
 
 test_spec_literal_wins := assert match rt.dispatch(spec_trie,
   tokens_of("/a/b")) {
@@ -215,60 +181,21 @@ test_group_absent_splat := assert rt.match_path(
 -- pipeline / chain / end / state
 -- ---------------------------------------------------------------------
 
-mw_tag := (ctx, next) ~> do {
-  r := next(rt.state_put(ctx, "tag", "mw"))
-  { out: r.out, state: r.state }
-}
-
-mw_short := (_ctx, _next) ~> do {
-  { out: { status: 401, body: "denied" }, state: {} }
-}
-
-boom := (_ctx) ~> error.raise("must not run")
-
 test_chain_basic := assert rt.chain([rt.end(
   (req) ~> { status: 200, body: "hi " + req.path })])(
   { path: "/x" }) == { status: 200, body: "hi /x" }
 
 -- middleware order: outer mw runs first, state threads through
-mw_a := (ctx, next) ~> do {
-  s0 := rt.state_get(ctx, "seq")
-  s := if s0 == null { "" } else { s0 }
-  r := next(rt.state_put(ctx, "seq", s + "A"))
-  { out: r.out, state: r.state }
-}
-
-mw_b := (ctx, next) ~> do {
-  s0 := rt.state_get(ctx, "seq")
-  s := if s0 == null { "" } else { s0 }
-  r := next(rt.state_put(ctx, "seq", s + "B"))
-  { out: r.out, state: r.state }
-}
-
-seq_term := (ctx) ~> do {
-  { out: rt.state_get(ctx, "seq"), state: {} }
-}
 
 test_chain_mw_order := assert rt.chain([mw_a, mw_b, seq_term])(
   { path: "/" }) == "AB"
 
 -- state flows inward via state_put, outward via the {out,state} pair
-state_term := (ctx) ~> do {
-  { out: rt.state_get(ctx, "who"), state: { seen: true } }
-}
-
-mw_who := (ctx, next) ~> do {
-  r := next(rt.state_put(ctx, "who", "inner"))
-  { out: r.out, state: r.state }
-}
 
 test_pipeline_state := assert match rt.pipeline([mw_who, state_term])(
   { req: {}, state: {} }) {
   r: r.out == "inner" && hash_map.get_or(r.state, "seen", false) == true,
   _: false }
-
-ctx0 := { req: {}, state: {} }
-ctx1 := rt.state_put(ctx0, "k", "v")
 
 test_state_put_get := assert rt.state_get(ctx1, "k") == "v" &&
   rt.state_get(ctx0, "k") == null
@@ -289,30 +216,6 @@ test_pipeline_rejects_empty := assert match error.try(
 -- ---------------------------------------------------------------------
 -- route_map: nested `{ name: leaf | subtree }` maps -> compile entries
 -- ---------------------------------------------------------------------
-
-rm_h := (r) ~> r
-
---- first entry whose derived/explicit `name` is `n`, or null.
-rm_find := (ents, n) ~> while { xs: ents, out: null } {
-  (xs, out) ~> match xs {
-    []: { out: out },
-    [e, ...t]: if hash_map.get_or(e, "name", null) == n {
-      { out: e }
-    } else {
-      { state: { xs: t, out: out } }
-    }
-  }
-}
-
-rm_map := rt.route_map({
-  ".": rm_h,
-  health: rm_h,
-  users: { ":id": rm_h },
-  api: { v1: { get: rm_h, post: rm_h, path: "/v1" } },
-  s: { method: "put", path: "explicit", handler: rm_h,
-       constraints: { q: "yes" }, doc: { summary: "x" }, name: "op" }
-}, { methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
-  "OPTIONS"] })
 
 test_rm_index := assert match rm_find(rm_map, "index") {
   e: e != null && e.path == "/" && e.method == "*",
@@ -359,27 +262,17 @@ test_rm_defaults := assert match rt.route_map({ a: rm_h }) {
     is_arrow(hash_map.get_or(e, "handler", null)),
   _: false }
 
--- custom leaf_keys: the payload field is copied, other fields are not.
-rm_cb := rt.route_map({ cb: { run: rm_h, tag: "x" } },
-  { leaf_keys: ["run"] })
-
 test_rm_leaf_keys := assert match rm_cb {
   [e]: e.path == "/cb" && e.name == "cb" &&
     is_arrow(hash_map.get_or(e, "run", null)) &&
     hash_map.has(e, "tag") == false,
   _: false }
 
--- sep override joins key segments with the transport separator.
-rm_sep := rt.route_map({ a: { b: rm_h } }, { sep: ":" })
-
 test_rm_sep := assert match rm_sep {
   [e]: e.path == ":a:b" && e.name == "a:b",
   _: false }
 
 -- spec_keys allow extra config fields inside method maps and pass
--- them through verbatim onto each entry.
-rm_mspec := rt.route_map({ a: { get: rm_h, doc: { t: 1 } } },
-  { methods: ["GET"], spec_keys: ["doc"] })
 
 test_rm_spec_keys := assert match rm_mspec {
   [e]: e.method == "GET" && e.doc := { t: 1 },
@@ -399,7 +292,6 @@ test_rm_err_handler := assert match error.try(
   err(e): true, _: false }
 
 -- flattened entries feed straight into compile/dispatch.
-rm_trie := rt.compile(rm_map)
 
 test_rm_compile_roundtrip := assert match rt.dispatch(rm_trie,
   tokens_of("/users/9")) {
